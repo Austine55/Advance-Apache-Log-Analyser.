@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Advanced Log Analyzer</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha3/dist/css/bootstrap.min.css">
+  <style>
+    /* Basic styling */
+    .log-table { font-size: 12px; }
+    .dos-alert { background-color: #ffebee; }
+    .traffic-spike { background-color: #fff3cd; }
+    .suspicious-ip { background-color: #f8d7da; }
+    .metric-card { background: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 15px; }
+    #loadingSpinner { display: none; }
+    /* Hide all result containers by default */
+    .result-container { display: none; }
+  </style>
+</head>
+<body class="p-4">
+  <h1 class="text-center mb-4">Apache Log Analysis System</h1>
+
+  <!-- Error message -->
+  <div id="errorMessage" class="alert alert-danger" role="alert" style="display: none;"></div>
+
+  <!-- Upload form and analysis mode selection -->
+  <form id="uploadForm" enctype="multipart/form-data">
+    <div class="mb-3">
+      <label for="logFile" class="form-label">Upload Log File</label>
+      <input type="file" name="logFile" id="logFile" class="form-control" required>
+    </div>
+    <div class="mb-3">
+      <label for="analysisType" class="form-label">Analysis Mode</label>
+      <select name="analysisType" id="analysisType" class="form-select" required>
+        <option value="displayAll">Display All Logs</option>
+        <option value="trafficVolume">Traffic Spikes</option>
+        <option value="multipleRequests">Suspicious IPs</option>
+        <option value="dosDetection">DoS Detection</option>
+      </select>
+    </div>
+    <!-- Additional parameters -->
+    <div class="row g-3" id="analysisParams">
+      <!-- DoS parameters -->
+      <div class="col-md-4" id="dosParams" style="display: none;">
+        <label for="timeWindow" class="form-label">Detection Window (seconds)</label>
+        <input type="number" id="timeWindow" class="form-control" value="1" min="1">
+      </div>
+      <!-- Request threshold (for DoS and Suspicious IPs) -->
+      <div class="col-md-4" id="requestThresholdDiv" style="display: none;">
+        <label for="requestThreshold" class="form-label">Request Threshold</label>
+        <input type="number" id="requestThreshold" class="form-control" value="100" min="1">
+      </div>
+      <!-- Frequency threshold (for Suspicious IPs) -->
+      <div class="col-md-4" id="frequencyParams" style="display: none;">
+        <label for="frequencyThreshold" class="form-label">Frequency Threshold (seconds)</label>
+        <input type="number" id="frequencyThreshold" class="form-control" value="10" min="1">
+      </div>
+    </div>
+    <button type="button" id="analyzeBtn" class="btn btn-primary w-100 mt-3">Start Analysis</button>
+  </form>
+
+  <!-- Processing spinner -->
+  <div id="loadingSpinner" class="text-center mt-3">
+    <div class="spinner-border text-primary" role="status"></div>
+    <span class="ms-2">Processing...</span>
+  </div>
+
+  <!-- Metrics display -->
+  <div id="metrics" class="row mt-4 g-3" style="display: none;">
+    <div class="col-md-4">
+      <div class="metric-card">
+        <h5>Total Requests</h5>
+        <div class="metric-value" id="totalRequests">0</div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="metric-card">
+        <h5>Unique IPs</h5>
+        <div class="metric-value" id="uniqueIPs">0</div>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <div class="metric-card">
+        <h5>Security Events</h5>
+        <div class="metric-value" id="securityEvents">0</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Result containers for each mode -->
+  <div id="resultsDisplayAll" class="result-container mt-4">
+    <h3>All Log Entries</h3>
+    <table class="table table-hover log-table">
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>IP Address</th>
+          <th>Request Type</th>
+          <th>Response Code</th>
+        </tr>
+      </thead>
+      <tbody id="resultBodyDisplayAll"></tbody>
+    </table>
+    <button id="loadMoreDisplayAll" class="btn btn-secondary w-100" style="display: none;">Load More Data</button>
+  </div>
+
+  <div id="resultsTraffic" class="result-container mt-4">
+    <h3>Traffic Spike Summary</h3>
+    <div id="trafficSummary"></div>
+  </div>
+
+  <div id="resultsSuspicious" class="result-container mt-4">
+    <h3>Suspicious IP Addresses</h3>
+    <table class="table table-hover log-table">
+      <thead>
+        <tr>
+          <th>IP Address</th>
+          <th>Request Count</th>
+        </tr>
+      </thead>
+      <tbody id="resultBodySuspicious"></tbody>
+    </table>
+  </div>
+
+  <div id="resultsDoS" class="result-container mt-4">
+    <h3>DoS Detection Summary</h3>
+    <div id="dosSummary"></div>
+  </div>
+
+  <script>
+    /*************************************
+     * Configuration & Global State
+     *************************************/
+    const PROCESSING_CONFIG = {
+      CHUNK_SIZE: 64 * 1024, // 64KB chunks
+      UI_UPDATE_INTERVAL: 250 // UI update delay in ms
+    };
+
+    // Global state for file, parsed logs, and detection results.
+    let analysisState = {
+      file: null,       // The uploaded log file
+      offset: 0,        // Current file offset
+      buffer: '',       // Buffer for incomplete data
+      logs: [],         // Array for all parsed logs
+      displayCount: 10, // Number of entries to show for "Display All"
+      metrics: {
+        totalRequests: 0,
+        uniqueIPs: new Set(),
+        securityEvents: 0
+      },
+      detectionSystems: {
+        // For traffic spikes (requests per second)
+        trafficCounts: new Map(),
+        // For suspicious IPs (storing timestamps)
+        requestHistory: new Map(),
+        suspiciousIPs: new Set(),
+        // For DoS detection (timestamps per IP)
+        ipRegistry: new Map(),
+        dosAttacks: new Set()
+      }
+    };
+
+    /*************************************
+     * Initialization Function
+     *************************************/
+    function initializeAnalysis() {
+      analysisState = {
+        file: null,
+        offset: 0,
+        buffer: '',
+        logs: [],
+        displayCount: 10,
+        metrics: {
+          totalRequests: 0,
+          uniqueIPs: new Set(),
+          securityEvents: 0
+        },
+        detectionSystems: {
+          trafficCounts: new Map(),
+          requestHistory: new Map(),
+          suspiciousIPs: new Set(),
+          ipRegistry: new Map(),
+          dosAttacks: new Set()
+        }
+      };
+      // Clear all result containers
+      document.getElementById('resultBodyDisplayAll').innerHTML = '';
+      document.getElementById('trafficSummary').innerHTML = '';
+      document.getElementById('resultBodySuspicious').innerHTML = '';
+      document.getElementById('dosSummary').innerHTML = '';
+      hideError();
+    }
+
+    /*************************************
+     * File Processing Function
+     *************************************/
+    // Reads a 64KB chunk from the file, processes complete lines.
+    async function processDataChunk() {
+      if (analysisState.offset >= analysisState.file.size) return;
+      const chunk = analysisState.file.slice(analysisState.offset, analysisState.offset + PROCESSING_CONFIG.CHUNK_SIZE);
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          analysisState.buffer += e.target.result;
+          const lines = analysisState.buffer.split('\n');
+          // Retain the last partial line
+          analysisState.buffer = lines.pop() || '';
+          lines.forEach(processLogEntry);
+          analysisState.offset += PROCESSING_CONFIG.CHUNK_SIZE;
+          resolve();
+        };
+        reader.onerror = reject;
+        reader.readAsText(chunk);
+      });
+    }
+
+    /*************************************
+     * Log Parsing & Common Detection
+     *************************************/
+    // Parse each log line and update global state.
+    function processLogEntry(entry) {
+      if (!entry.trim()) return;
+      const logPattern = /^(\S+) - - \[([^\]]+)\] "(\S+).*?" (\d{3})/;
+      const match = entry.match(logPattern);
+      if (!match) return;
+      const [ , ip, timestampStr, method, status ] = match;
+      const timestamp = new Date(timestampStr.replace(':', ' '));
+      const logEntry = { ip, timestamp, method, status };
+      analysisState.logs.push(logEntry);
+      analysisState.metrics.totalRequests++;
+      analysisState.metrics.uniqueIPs.add(ip);
+
+      // Get current time for this log
+      const currentTime = timestamp.getTime();
+
+      // --- Traffic Spike Detection ---
+      const timeKey = Math.floor(currentTime / 1000);
+      analysisState.detectionSystems.trafficCounts.set(
+        timeKey, (analysisState.detectionSystems.trafficCounts.get(timeKey) || 0) + 1
+      );
+
+      // --- Suspicious IPs Detection ---
+      const freqThreshold = parseInt(document.getElementById('frequencyThreshold').value) * 1000;
+      const ipHistory = analysisState.detectionSystems.requestHistory.get(ip) || [];
+      if (ipHistory.length > 0 && (currentTime - ipHistory[ipHistory.length - 1]) < freqThreshold) {
+        analysisState.detectionSystems.suspiciousIPs.add(ip);
+        analysisState.metrics.securityEvents++;
+      }
+      analysisState.detectionSystems.requestHistory.set(ip, [...ipHistory, currentTime]);
+
+      // --- DoS Detection ---
+      const windowSize = parseInt(document.getElementById('timeWindow').value) * 1000; // in ms
+      const reqThreshold = parseInt(document.getElementById('requestThreshold').value);
+      let ipLogs = (analysisState.detectionSystems.ipRegistry.get(ip) || [])
+                    .filter(ts => currentTime - ts <= windowSize);
+      ipLogs.push(currentTime);
+      analysisState.detectionSystems.ipRegistry.set(ip, ipLogs);
+      // If requests are tightly clustered and exceed threshold, flag DoS.
+      if (ipLogs.length >= reqThreshold &&
+          (ipLogs[ipLogs.length - 1] - ipLogs[0] < windowSize * 0.5) &&
+          !analysisState.detectionSystems.dosAttacks.has(ip)) {
+        analysisState.metrics.securityEvents++;
+        analysisState.detectionSystems.dosAttacks.add(ip);
+      }
+
+      // Update metrics display
+      document.getElementById('totalRequests').textContent = analysisState.metrics.totalRequests.toLocaleString();
+      document.getElementById('uniqueIPs').textContent = analysisState.metrics.uniqueIPs.size.toLocaleString();
+      document.getElementById('securityEvents').textContent = analysisState.metrics.securityEvents.toLocaleString();
+    }
+
+    /*************************************
+     * Update Display Functions
+     *************************************/
+    // Hide all result containers.
+    function hideAllResults() {
+      document.querySelectorAll('.result-container').forEach(el => el.style.display = 'none');
+    }
+
+    // For "Display All Logs": update the table with the first displayCount logs.
+    function updateDisplayAllResults() {
+      const tbody = document.getElementById('resultBodyDisplayAll');
+      tbody.innerHTML = '';
+      const logsToShow = analysisState.logs.slice(0, analysisState.displayCount);
+      logsToShow.forEach(log => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+          <td>${log.timestamp.toLocaleString()}</td>
+          <td>${log.ip}</td>
+          <td>${log.method}</td>
+          <td>${log.status}</td>
+        `;
+        tbody.appendChild(row);
+      });
+      // Show load more button if more logs are available.
+      document.getElementById('loadMoreDisplayAll').style.display =
+        (analysisState.offset < analysisState.file.size || analysisState.displayCount < analysisState.logs.length)
+          ? 'block'
+          : 'none';
+    }
+
+    // For "Traffic Spikes": show a summary based on trafficCounts.
+    function updateTrafficSummary() {
+      const counts = Array.from(analysisState.detectionSystems.trafficCounts.values());
+      const total = counts.reduce((a, b) => a + b, 0);
+      const seconds = analysisState.detectionSystems.trafficCounts.size;
+      const avg = seconds > 0 ? (total / seconds).toFixed(2) : 0;
+      // Count seconds with traffic > 2 * average.
+      let spikeCount = 0;
+      analysisState.detectionSystems.trafficCounts.forEach(count => {
+        if (count > avg * 2) spikeCount++;
+      });
+      document.getElementById('trafficSummary').innerHTML = `
+        <p>Total Requests: ${total}</p>
+        <p>Average Requests per Second: ${avg}</p>
+        <p>Number of Spike Seconds: ${spikeCount}</p>
+      `;
+    }
+
+    // For "Suspicious IPs": list suspicious IPs with their request counts.
+    function updateSuspiciousResults() {
+      const tbody = document.getElementById('resultBodySuspicious');
+      tbody.innerHTML = '';
+      // Iterate over requestHistory and check if IP is flagged.
+      analysisState.detectionSystems.requestHistory.forEach((timestamps, ip) => {
+        if (analysisState.detectionSystems.suspiciousIPs.has(ip)) {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${ip}</td>
+            <td>${timestamps.length}</td>
+          `;
+          tbody.appendChild(row);
+        }
+      });
+    }
+
+    // For "DoS Detection": show a summary of flagged DoS IPs.
+    function updateDosSummary() {
+      const dosSummaryDiv = document.getElementById('dosSummary');
+      if (analysisState.detectionSystems.dosAttacks.size === 0) {
+        dosSummaryDiv.innerHTML = '<p class="alert alert-info">No DoS signs detected.</p>';
+      } else {
+        let list = '<ul>';
+        analysisState.detectionSystems.dosAttacks.forEach(ip => {
+          list += `<li>${ip}</li>`;
+        });
+        list += '</ul>';
+        dosSummaryDiv.innerHTML = `<p>DoS Attack(s) Detected from the following IP(s):</p>${list}`;
+      }
+    }
+
+    /*************************************
+     * UI Helper Functions
+     *************************************/
+    function toggleProcessingUI(processing) {
+      document.getElementById('loadingSpinner').style.display = processing ? 'block' : 'none';
+    }
+    function showError(message) {
+      const errorDiv = document.getElementById('errorMessage');
+      errorDiv.textContent = message;
+      errorDiv.style.display = 'block';
+      setTimeout(() => errorDiv.style.display = 'none', 5000);
+    }
+    function hideError() {
+      document.getElementById('errorMessage').style.display = 'none';
+    }
+
+    /*************************************
+     * Event Listeners
+     *************************************/
+    // When analysis type changes, show/hide parameter fields and result containers.
+    document.getElementById('analysisType').addEventListener('change', function() {
+      const mode = this.value;
+      // Show DoS-specific parameters only for dosDetection.
+      document.getElementById('dosParams').style.display = mode === 'dosDetection' ? 'block' : 'none';
+      // Show request threshold for dosDetection and multipleRequests.
+      document.getElementById('requestThresholdDiv').style.display =
+        (mode === 'dosDetection' || mode === 'multipleRequests') ? 'block' : 'none';
+      // Show frequency threshold only for multipleRequests.
+      document.getElementById('frequencyParams').style.display = mode === 'multipleRequests' ? 'block' : 'none';
+      // Hide all result containers initially.
+      hideAllResults();
+      // Also hide metrics (they'll be shown once analysis starts).
+      document.getElementById('metrics').style.display = 'none';
+    });
+
+    // "Start Analysis" button: initializes and processes the first chunk.
+    document.getElementById('analyzeBtn').addEventListener('click', async () => {
+      const fileInput = document.getElementById('logFile');
+      if (!fileInput.files.length) return showError('Please select a log file');
+      const mode = document.getElementById('analysisType').value;
+      initializeAnalysis();
+      analysisState.file = fileInput.files[0];
+      document.getElementById('metrics').style.display = 'flex';
+      // Hide all result containers then show only the one for the selected mode.
+      hideAllResults();
+      if (mode === 'displayAll') {
+        document.getElementById('resultsDisplayAll').style.display = 'block';
+      } else if (mode === 'trafficVolume') {
+        document.getElementById('resultsTraffic').style.display = 'block';
+      } else if (mode === 'multipleRequests') {
+        document.getElementById('resultsSuspicious').style.display = 'block';
+      } else if (mode === 'dosDetection') {
+        document.getElementById('resultsDoS').style.display = 'block';
+      }
+      toggleProcessingUI(true);
+      try {
+        await processDataChunk();
+        updateResultsForMode(mode);
+      } catch (error) {
+        showError(`Processing failed: ${error.message}`);
+      }
+      toggleProcessingUI(false);
+    });
+
+    // "Load More Data" button: process next chunk and update current view.
+    // Only applicable for "Display All" mode; for summaries, simply process more chunks.
+    document.getElementById('loadMoreDisplayAll').addEventListener('click', async () => {
+      const mode = document.getElementById('analysisType').value;
+      toggleProcessingUI(true);
+      try {
+        if (analysisState.offset < analysisState.file.size) {
+          await processDataChunk();
+        }
+        // For "Display All", increase the number of entries to show.
+        if (mode === 'displayAll') {
+          analysisState.displayCount += 10;
+        }
+        updateResultsForMode(mode);
+      } catch (error) {
+        showError(`Processing failed: ${error.message}`);
+      }
+      toggleProcessingUI(false);
+    });
+
+    // Update results based on the active mode.
+    function updateResultsForMode(mode) {
+      if (mode === 'displayAll') {
+        updateDisplayAllResults();
+      } else if (mode === 'trafficVolume') {
+        updateTrafficSummary();
+      } else if (mode === 'multipleRequests') {
+        updateSuspiciousResults();
+      } else if (mode === 'dosDetection') {
+        updateDosSummary();
+      }
+    }
+  </script>
+</body>
+</html>
